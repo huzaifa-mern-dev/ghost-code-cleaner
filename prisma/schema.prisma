@@ -1,0 +1,106 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// Store — represents one installed Shopify shop
+// ─────────────────────────────────────────────
+model Store {
+  id          String   @id @default(cuid())
+  shopDomain  String   @unique
+  accessToken String
+  planTier    String   @default("free")
+  createdAt   DateTime @default(now())
+
+  audits       Audit[]
+  purgeJobs    PurgeJob[]
+  subscription Subscription?
+
+  @@map("stores")
+}
+
+// ─────────────────────────────────────────────
+// Audit — one crawl-and-analyse run per store
+// ─────────────────────────────────────────────
+model Audit {
+  id              String    @id @default(cuid())
+  storeId         String
+  status          String    @default("pending") // pending | running | completed | failed
+  startedAt       DateTime  @default(now())
+  completedAt     DateTime?
+  summary         Json?
+  crawlDurationMs Int?
+
+  store    Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  findings Finding[]
+  purgeJobs PurgeJob[]
+
+  @@map("audits")
+}
+
+// ─────────────────────────────────────────────
+// Finding — one detected orphan CSS/JS asset
+// ─────────────────────────────────────────────
+model Finding {
+  id                    String  @id @default(cuid())
+  auditId               String
+  type                  String  // css | js
+  selector              String?
+  fileUrl               String
+  sourceApp             String?
+  cdpCoveragePercent    Float?
+  confidence            String  // high | medium | low
+  removalRisk           String  // safe | moderate | risky
+  estimatedPayloadBytes Int?
+  reason                String?
+  approvedForPurge      Boolean @default(false)
+
+  audit Audit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  @@map("findings")
+}
+
+// ─────────────────────────────────────────────
+// PurgeJob — background job to remove orphans
+// ─────────────────────────────────────────────
+model PurgeJob {
+  id               String    @id @default(cuid())
+  storeId          String
+  auditId          String
+  sourceThemeId    Int
+  duplicateThemeId Int?
+  status           String    @default("pending") // pending | running | completed | failed | rolled_back
+  diffJson         Json?
+  previewUrl       String?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  audit Audit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  @@map("purge_jobs")
+}
+
+// ─────────────────────────────────────────────
+// Subscription — Stripe billing per store
+// ─────────────────────────────────────────────
+model Subscription {
+  id                String    @id @default(cuid())
+  storeId           String    @unique
+  stripeCustomerId  String?
+  stripePriceId     String?
+  status            String    // active | trialing | past_due | canceled
+  currentPeriodEnd  DateTime?
+
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}

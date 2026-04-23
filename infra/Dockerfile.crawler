@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────
+# Stage: Base — Node 20 slim with Chrome
+# ─────────────────────────────────────────────
+FROM node:20-slim AS base
+
+# Install Google Chrome stable and all Chromium Linux dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    ca-certificates \
+    apt-transport-https \
+    --no-install-recommends \
+  && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+  && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+  && apt-get update \
+  && apt-get install -y \
+    google-chrome-stable \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-thai-tlwg \
+    fonts-kacst \
+    fonts-freefont-ttf \
+    libxss1 \
+    --no-install-recommends \
+  && rm -rf /var/lib/apt/lists/*
+
+# Skip bundled Chromium — use system Chrome
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
+
+# ─────────────────────────────────────────────
+# Stage: Dependencies
+# ─────────────────────────────────────────────
+FROM base AS deps
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+COPY apps/api/package.json ./apps/api/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/crawler/package.json ./packages/crawler/
+COPY packages/analyzer/package.json ./packages/analyzer/
+COPY packages/classifier/package.json ./packages/classifier/
+COPY packages/shopify/package.json ./packages/shopify/
+COPY packages/theme-editor/package.json ./packages/theme-editor/
+
+RUN npm ci --workspace=apps/api --workspace=packages/shared \
+           --workspace=packages/crawler --workspace=packages/analyzer \
+           --workspace=packages/classifier --workspace=packages/shopify \
+           --workspace=packages/theme-editor
+
+# ─────────────────────────────────────────────
+# Stage: Builder
+# ─────────────────────────────────────────────
+FROM deps AS builder
+
+WORKDIR /app
+
+COPY . .
+
+RUN npm run build --workspace=packages/shared \
+  && npm run build --workspace=packages/crawler \
+  && npm run build --workspace=packages/analyzer \
+  && npm run build --workspace=packages/classifier \
+  && npm run build --workspace=packages/shopify \
+  && npm run build --workspace=packages/theme-editor \
+  && npm run build --workspace=apps/api
+
+# ─────────────────────────────────────────────
+# Stage: Production Runner
+# ─────────────────────────────────────────────
+FROM base AS runner
+
+WORKDIR /app
+
+# Non-root user for security
+RUN groupadd --gid 1001 nodejs \
+  && useradd --uid 1001 --gid nodejs --shell /bin/bash --create-home ghost
+
+# Copy built artefacts from builder
+COPY --from=builder --chown=ghost:nodejs /app/apps/api/dist ./apps/api/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/shared/dist ./packages/shared/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/crawler/dist ./packages/crawler/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/analyzer/dist ./packages/analyzer/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/classifier/dist ./packages/classifier/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/shopify/dist ./packages/shopify/dist
+COPY --from=builder --chown=ghost:nodejs /app/packages/theme-editor/dist ./packages/theme-editor/dist
+COPY --from=builder --chown=ghost:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=ghost:nodejs /app/package.json ./package.json
+COPY --from=builder --chown=ghost:nodejs /app/prisma ./prisma
+
+USER ghost
+
+EXPOSE 3001
+
+ENV NODE_ENV=production
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
+
+CMD ["node", "apps/api/dist/server.js"]

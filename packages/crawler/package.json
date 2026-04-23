@@ -1,0 +1,37 @@
+{
+  "name": "@ghost/crawler",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ghost-code": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "@ghost/shared": "*",
+    "@ghost/analyzer": "*",
+    "@ghost/classifier": "*",
+    "puppeteer": "^23.11.1",
+    "playwright": "^1.50.1",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.7"
+  },
+  "config": {
+    "puppeteer_skip_chromium_download": "true"
+  }
+}
