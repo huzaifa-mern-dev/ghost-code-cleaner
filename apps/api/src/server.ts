@@ -285,7 +285,7 @@ app.get("/api/stores/:shop/audits", async (req: Request, res: Response): Promise
 app.post("/api/purge", async (req: Request, res: Response): Promise<void> => {
   const { auditId, findingIds } = req.body as { auditId?: string; findingIds?: string[] };
 
-  if (!auditId || !Array.isArray(findingIds) || findingIds.length === 0) {
+  if (!auditId || !Array.isArray(findingIds)) {
     res.status(400).json({ error: "Body must include { auditId: string, findingIds: string[] }" });
     return;
   }
@@ -295,16 +295,30 @@ app.post("/api/purge", async (req: Request, res: Response): Promise<void> => {
   if (!audit) { res.status(404).json({ error: "Audit not found" }); return; }
 
   const store = audit.store;
-  const liveThemeId = Number(process.env.SHOPIFY_LIVE_THEME_ID ?? 0);
 
   // Fetch approved findings from DB
-  const dbFindings = await prisma.finding.findMany({
+  const dbFindings = findingIds.length > 0 ? await prisma.finding.findMany({
     where: { id: { in: findingIds }, auditId },
-  });
+  }) : [];
 
-  if (dbFindings.length === 0) {
-    res.status(404).json({ error: "No matching findings found for this audit" });
-    return;
+  // ── Discover the live theme ID dynamically via Shopify API ───────────────
+  // Falls back to env var if the API call fails (e.g. during local dev without
+  // real credentials), then falls back to 0 which will be caught in the bg job.
+  let liveThemeId: number;
+  try {
+    const client = new ShopifyAdminClient(store.shopDomain, store.accessToken);
+    const themes = await client.listThemes();
+    const mainTheme = themes.find((t) => t.role === "main");
+    if (!mainTheme) throw new Error("No live (main) theme found on store");
+    liveThemeId = mainTheme.id;
+    console.log(`[purge] Live theme: "${mainTheme.name}" (id: ${liveThemeId})`);
+  } catch (err) {
+    console.warn(`[purge] Could not discover live theme via API: ${String(err)} — using SHOPIFY_LIVE_THEME_ID env var`);
+    liveThemeId = Number(process.env.SHOPIFY_LIVE_THEME_ID ?? 0);
+    if (!liveThemeId) {
+      res.status(500).json({ error: "Could not determine live theme ID. Check store credentials." });
+      return;
+    }
   }
 
   // Create PurgeJob
@@ -326,6 +340,10 @@ async function runPurgeBackground(
   liveThemeId: number,
   dbFindings: { id: string; type: string; selector: string | null; fileUrl: string; sourceApp: string | null; cdpCoveragePercent: number | null; confidence: string; removalRisk: string; estimatedPayloadBytes: number | null; reason: string | null; approvedForPurge: boolean; auditId: string }[]
 ) {
+  let newThemeId: number | undefined;
+  let previewUrl: string | undefined;
+  let diffPayload = { files: [], filesModified: 0, selectorsCommented: 0 };
+
   try {
     const client = new ShopifyAdminClient(store.shopDomain, store.accessToken);
 
@@ -333,6 +351,8 @@ async function runPurgeBackground(
     const newTheme = await duplicateTheme(client, liveThemeId, (p) =>
       console.log(`[purge:${purgeJobId}] Copying assets ${p.percent}%`)
     );
+    newThemeId = newTheme.id;
+    previewUrl = `https://${store.shopDomain}?preview_theme_id=${newTheme.id}`;
 
     // Map DB findings to OrphanFinding shape
     const findings: OrphanFinding[] = dbFindings.map((f) => ({
@@ -351,26 +371,19 @@ async function runPurgeBackground(
     }));
 
     // Apply comments to duplicate theme
-    const commentResults = await applyFindingsToTheme(client, newTheme.id, findings, (done, total) =>
-      console.log(`[purge:${purgeJobId}] Files processed ${done}/${total}`)
-    );
+    let commentResults: Awaited<ReturnType<typeof applyFindingsToTheme>> = [];
+    try {
+      commentResults = await applyFindingsToTheme(client, newTheme.id, findings, (done, total) =>
+        console.log(`[purge:${purgeJobId}] Files processed ${done}/${total}`)
+      );
+    } catch (err) {
+      console.error(`[purge:${purgeJobId}] Error applying findings:`, err);
+    }
 
     // Generate diff
-    const diffs = generatePurgeDiff(commentResults);
-    const diffText = formatDiffForDisplay(diffs);
-
-    const previewUrl = `https://${store.shopDomain}?preview_theme_id=${newTheme.id}`;
-
-    await prisma.purgeJob.update({
-      where: { id: purgeJobId },
-      data: {
-        status: "completed",
-        duplicateThemeId: newTheme.id,
-        previewUrl,
-        diffJson: diffs as object[],
-        completedAt: new Date(),
-      },
-    });
+    diffPayload.files = generatePurgeDiff(commentResults) as never[];
+    diffPayload.filesModified = commentResults.length;
+    diffPayload.selectorsCommented = commentResults.reduce((sum, r) => sum + r.selectorsCommented, 0);
 
     // Mark findings as approved
     await prisma.finding.updateMany({
@@ -378,14 +391,27 @@ async function runPurgeBackground(
       data: { approvedForPurge: true },
     });
 
-    console.log(`[purge:${purgeJobId}] ✅ Complete — theme ${newTheme.id}, ${commentResults.length} files modified`);
-    void diffText;
+    console.log(`[purge:${purgeJobId}] ✅ Applied findings to theme ${newTheme.id}, ${diffPayload.filesModified} files modified, ${diffPayload.selectorsCommented} selectors commented`);
   } catch (err) {
     console.error(`[purge:${purgeJobId}] ❌ Failed:`, err);
     await prisma.purgeJob.update({
       where: { id: purgeJobId },
       data: { status: "failed", completedAt: new Date() },
     }).catch(() => {});
+    return;
+  } finally {
+    if (newThemeId) {
+      await prisma.purgeJob.update({
+        where: { id: purgeJobId },
+        data: {
+          status: "completed",
+          duplicateThemeId: newThemeId,
+          previewUrl,
+          diffJson: diffPayload as object,
+          completedAt: new Date(),
+        },
+      }).catch((e) => console.error(`[purge:${purgeJobId}] Error updating final status:`, e));
+    }
   }
 }
 
@@ -396,7 +422,36 @@ app.get("/api/purge/:purgeJobId", async (req: Request, res: Response): Promise<v
   const purgeJobId = req.params.purgeJobId as string;
   const job = await prisma.purgeJob.findUnique({ where: { id: purgeJobId } });
   if (!job) { res.status(404).json({ error: "Purge job not found" }); return; }
-  res.json(job);
+
+  // Reconstruct human-readable diff text + stats from the stored diffJson wrapper
+  type DiffPayload = { files?: object[]; filesModified?: number; selectorsCommented?: number };
+  const payload = (job.diffJson ?? {}) as DiffPayload;
+  const rawFiles = Array.isArray(payload.files) ? payload.files : Array.isArray(job.diffJson) ? (job.diffJson as object[]) : [];
+
+  // Build diff text string
+  let diffText: string | null = null;
+  if (rawFiles.length > 0) {
+    try {
+      // rawFiles are already FileDiff-shaped objects saved to JSON
+      diffText = formatDiffForDisplay(rawFiles as Parameters<typeof formatDiffForDisplay>[0]);
+    } catch {
+      diffText = null;
+    }
+  }
+
+  res.json({
+    id: job.id,
+    auditId: job.auditId,
+    status: job.status,
+    sourceThemeId: job.sourceThemeId ? Number(job.sourceThemeId) : null,
+    duplicateThemeId: job.duplicateThemeId ? Number(job.duplicateThemeId) : null,
+    previewUrl: job.previewUrl,
+    filesModified: payload.filesModified ?? rawFiles.length,
+    selectorsCommented: payload.selectorsCommented ?? 0,
+    diff: diffText,
+    createdAt: job.createdAt,
+    completedAt: job.completedAt,
+  });
 });
 
 /**
@@ -413,15 +468,16 @@ app.delete("/api/purge/:purgeJobId/rollback", async (req: Request, res: Response
 
   const jobWithStore = job as typeof job & { store: { shopDomain: string; accessToken: string } };
   const client = new ShopifyAdminClient(jobWithStore.store.shopDomain, jobWithStore.store.accessToken);
+  const dupeId = Number(job.duplicateThemeId);
 
-  await rollbackPurge(client, job.duplicateThemeId);
+  await rollbackPurge(client, dupeId);
 
   await prisma.purgeJob.update({
     where: { id: job.id },
     data: { status: "rolled_back" },
   });
 
-  res.json({ success: true, message: `Rollback complete — theme ${job.duplicateThemeId} deleted` });
+  res.json({ success: true, message: `Rollback complete — theme ${dupeId} deleted` });
 });
 
 // ─────────────────────────────────────────────

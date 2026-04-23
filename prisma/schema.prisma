@@ -75,8 +75,8 @@ model PurgeJob {
   id               String    @id @default(cuid())
   storeId          String
   auditId          String
-  sourceThemeId    Int
-  duplicateThemeId Int?
+  sourceThemeId    BigInt
+  duplicateThemeId BigInt?
   status           String    @default("pending") // pending | running | completed | failed | rolled_back
   diffJson         Json?
   previewUrl       String?
