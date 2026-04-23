@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@ghost/shared": "*",
+    "@ghost/shopify": "*",
     "@prisma/client": "^6.3.1",
     "bullmq": "^5.34.6",
     "cors": "^2.8.5",

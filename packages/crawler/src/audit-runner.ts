@@ -251,11 +251,27 @@ export async function runFullAudit(
     } catch { /* ignore malformed URL */ }
 
     // ── Step 3: Crawl templates (max 3 concurrent) ───────────────────────
+    // Each template is wrapped in its own try/catch so a network failure
+    // (ERR_CONNECTION_CLOSED, timeout, DNS error, etc.) on one template
+    // skips it gracefully instead of aborting the entire audit.
     const crawlTasks = crawlPlan.map(
-      (template) => () => crawlTemplate(browser, template, onProgress)
+      (template) => async (): Promise<TemplateCrawlResult | null> => {
+        try {
+          return await crawlTemplate(browser, template, onProgress);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[audit] ⚠️  Skipping template ${template.name}: ${msg}`);
+          return null;
+        }
+      }
     );
 
-    const crawlResults = await pLimit(crawlTasks, 3);
+    const rawCrawlResults = await pLimit(crawlTasks, 3);
+
+    // Filter out templates that failed; audit continues with the rest
+    const crawlResults = rawCrawlResults.filter(
+      (r): r is TemplateCrawlResult => r !== null
+    );
 
     const snapshots = crawlResults.map((r) => r.snapshot);
     const allNetworkRequests = crawlResults.flatMap((r) => r.networkRequests);

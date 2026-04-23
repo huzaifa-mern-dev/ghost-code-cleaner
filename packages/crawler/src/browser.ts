@@ -38,7 +38,7 @@ const CHROME_ARGS = [
 
 const DEFAULT_USER_AGENT = "GhostCodeBot/1.0";
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
-const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 // ─────────────────────────────────────────────
 // Browser lifecycle
