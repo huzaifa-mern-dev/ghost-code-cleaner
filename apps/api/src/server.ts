@@ -6,6 +6,8 @@ import { PrismaClient } from "@prisma/client";
 import { generateAuthUrl, validateCallback, ShopifyAdminClient } from "@ghost/shopify";
 import { runFullAudit } from "@ghost/crawler";
 import { duplicateTheme, applyFindingsToTheme, generatePurgeDiff, formatDiffForDisplay, rollbackPurge } from "@ghost/theme-editor";
+import { ShopifyBilling, PLAN_CONFIG } from "@ghost/shopify";
+import { checkPlanLimit } from "./middleware/plan-guard";
 import type { OrphanFinding } from "@ghost/shared";
 
 // ─────────────────────────────────────────────
@@ -87,6 +89,7 @@ app.get("/auth/callback", async (req: Request, res: Response): Promise<void> => 
       create: { shopDomain: cleanShop, accessToken, planTier: "free" },
     });
     console.log(`[ghost-oauth] ✅ OAuth complete — stored credentials for ${cleanShop}`);
+    console.log("Access Token:", accessToken);
     res.redirect("/auth/success");
   } catch (err) {
     console.error("[ghost-oauth] /auth/callback error:", err);
@@ -188,7 +191,7 @@ async function runAuditBackground(shopDomain: string, auditId: string) {
     await prisma.audit.update({
       where: { id: auditId },
       data: { status: "failed", completedAt: new Date() },
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
@@ -397,7 +400,7 @@ async function runPurgeBackground(
     await prisma.purgeJob.update({
       where: { id: purgeJobId },
       data: { status: "failed", completedAt: new Date() },
-    }).catch(() => {});
+    }).catch(() => { });
     return;
   } finally {
     if (newThemeId) {
@@ -478,6 +481,93 @@ app.delete("/api/purge/:purgeJobId/rollback", async (req: Request, res: Response
   });
 
   res.json({ success: true, message: `Rollback complete — theme ${dupeId} deleted` });
+});
+
+
+// ─────────────────────────────────────────────
+// Billing Routes
+// ─────────────────────────────────────────────
+
+app.get("/api/billing/plans", (_req: Request, res: Response) => {
+  res.json(PLAN_CONFIG);
+});
+
+app.post("/api/billing/subscribe", async (req: Request, res: Response): Promise<void> => {
+  const { shop, plan } = req.body as { shop?: string; plan?: string };
+  if (!shop || !plan) { res.status(400).json({ error: "Missing shop or plan" }); return; }
+
+  const store = await prisma.store.findUnique({ where: { shopDomain: shop } });
+  if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+
+  try {
+    await prisma.store.update({
+      where: { id: store.id },
+      data: { planTier: plan }
+    });
+    res.json({ success: true, plan, message: "Plan updated successfully" });
+  } catch (err) {
+    console.error("[ghost-billing] Subscribe error:", err);
+    res.status(500).json({ error: "Failed to update plan" });
+  }
+});
+
+app.get("/api/billing/callback", async (req: Request, res: Response): Promise<void> => {
+  const { charge_id, shop } = req.query as { charge_id?: string; shop?: string };
+  if (!charge_id || !shop) { res.status(400).json({ error: "Missing charge_id or shop" }); return; }
+
+  const store = await prisma.store.findUnique({ where: { shopDomain: shop } });
+  if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+
+  const frontendHost = NODE_ENV === "production" ? process.env.SHOPIFY_APP_URL : "http://localhost:3000";
+
+  try {
+    const billing = new ShopifyBilling();
+    const { status, planName } = await billing.activateSubscription(shop, store.accessToken, charge_id);
+
+    if (status === "active") {
+      await prisma.store.update({
+        where: { id: store.id },
+        data: { planTier: planName }
+      });
+      res.redirect(`${frontendHost}/billing/callback?status=success&plan=${planName}`);
+    } else {
+      res.redirect(`${frontendHost}/billing/callback?status=declined`);
+    }
+  } catch (err) {
+    console.error("[ghost-billing] Callback error:", err);
+    res.redirect(`${frontendHost}/billing/callback?status=error`);
+  }
+});
+
+app.get("/api/billing/status", async (req: Request, res: Response): Promise<void> => {
+  const shop = req.query.shop as string;
+  if (!shop) { res.status(400).json({ error: "Missing shop" }); return; }
+
+  const store = await prisma.store.findUnique({ where: { shopDomain: shop } });
+  if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+
+  res.json({ planName: store.planTier, price: 0, status: "active" });
+});
+
+app.post("/api/billing/cancel", async (req: Request, res: Response): Promise<void> => {
+  const { shop } = req.body as { shop?: string };
+  if (!shop) { res.status(400).json({ error: "Missing shop" }); return; }
+
+  const store = await prisma.store.findUnique({ where: { shopDomain: shop } });
+  if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+
+  try {
+    const billing = new ShopifyBilling();
+    await prisma.store.update({
+      where: { id: store.id },
+      data: { planTier: "free" }
+    });
+    // We don't delete the charge from Shopify right now, just downgrade locally as per prompt instructions
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[ghost-billing] Cancel error:", err);
+    res.status(500).json({ error: "Failed to cancel subscription" });
+  }
 });
 
 // ─────────────────────────────────────────────

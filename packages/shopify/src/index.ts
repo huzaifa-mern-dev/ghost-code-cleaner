@@ -21,3 +21,5 @@ export type {
   ScriptTag,
   ShopInfo,
 } from "./admin-client";
+
+export { ShopifyBilling, PLAN_CONFIG } from "./billing";
